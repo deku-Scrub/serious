@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import heapq
+import sys
+import shutil
 import subprocess
 import itertools
 import csv
@@ -100,6 +102,16 @@ where `n` is the number of consecutive, successfully recalled reviews of a given
         type=str,
         default=',',
         help='Delimiter',
+    )
+
+    edit_parser = subparsers.add_parser('edit')
+    edit_parser.add_argument(
+        '--editor',
+        type=str,
+        default='',
+        help='Program to use for editing.  This takes precedence over the `EDITOR` environment variable.'.format(
+            DEFAULT_DECK
+        ),
     )
 
     args = parser.parse_args()
@@ -217,12 +229,12 @@ def make_db(filename):
         db.execute(
             """
             CREATE TABLE IF NOT EXISTS Item (
+                question VARCHAR UNIQUE,
+                answer VARCHAR,
                 recalled INT DEFAULT 0,
                 forgot INT DEFAULT 0,
                 review_time INT DEFAULT 0,
                 trial INT DEFAULT 0,
-                question VARCHAR UNIQUE,
-                answer VARCHAR,
                 history VARCHAR DEFAULT "",
                 deck VARCHAR DEFAULT "{}"
                 )
@@ -232,23 +244,34 @@ def make_db(filename):
         return db
 
 
-def _insert_into_item(db, batch):
+def _import_batch_to_db(db, batch):
     with db:
         db.executemany(
-            'INSERT INTO Item (question, answer, deck) VALUES (?, ?, ?)',
-            (batch),
+            'INSERT INTO Item (question, answer, recalled, forgot, review_time, trial, history, deck) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            batch,
         )
 
 
-def add_items(db, deck, csv_rows, batch_size=1000):
+def _insert_into_item(deck):
+    def f(db, batch):
+        with db:
+            db.executemany(
+                'INSERT INTO Item (question, answer, deck) VALUES (?, ?, ?)',
+                (b + [deck] for b in batch),
+            )
+
+    return f
+
+
+def batch_sql_op(db, op, rows, batch_size=1000):
     batch = []
-    for row in csv_rows:
-        batch.append(row + [deck])
+    for row in rows:
+        batch.append(row)
         if len(batch) >= batch_size:
-            _insert_into_item(db, batch)
+            op(db, batch)
             batch = []
     if batch:
-        _insert_into_item(db, batch)
+        op(db, batch)
         batch = []
 
 
@@ -285,7 +308,11 @@ def add_items_from_files(db, args):
     for csv_filename in args.filenames:
         try:
             with open(csv_filename) as fis:
-                add_items(db, args.deck, csv.reader(fis, delimiter=args.delimiter))
+                batch_sql_op(
+                    db,
+                    _insert_into_item(args.deck),
+                    csv.reader(fis, delimiter=args.delimiter),
+                )
         except sqlite3.IntegrityError:
             print(f'Duplicate question in file `{csv_filename}`')
 
@@ -305,6 +332,48 @@ def start_review(items, db, intervals, args):
         print()
 
 
+def _export_to_csv(db_path, out_file):
+    with (
+        sqlite3.connect(db_path) as db,
+        open(out_file, mode='w') as fos,
+    ):
+        csv.writer(fos).writerows(
+            db.execute(
+                'SELECT question, answer, recalled, forgot, review_time, trial, history, deck FROM Item'
+            )
+        )
+
+
+def _import_db(csv_filename, db_name):
+    try:
+        tmp_db_name = os.path.join(_get_config_dir(), 'tmp.db')
+        with (
+            make_db(tmp_db_name) as tmp_db,
+            open(csv_filename) as fis,
+        ):
+            batch_sql_op(tmp_db, _import_batch_to_db, csv.reader(fis))
+        shutil.move(tmp_db_name, db_name)
+    except Exception as err:
+        print('Error importing csv data: {}'.format(err), file=sys.stderr)
+        os.remove(tmp_db_name)
+
+    os.remove(csv_filename)
+
+
+def edit(args):
+    editor = args.editor if args.editor else os.environ.get('EDITOR', '')
+    if not editor:
+        return False
+
+    tmp_csv_filename = os.path.join(_get_config_dir(), 'tmp.csv')
+
+    _export_to_csv(args.db_path, tmp_csv_filename)
+    subprocess.run(f'{editor} {tmp_csv_filename}', text=True, shell=True)
+    _import_db(tmp_csv_filename, args.db_path)
+
+    return True
+
+
 def main():
     os.makedirs(_get_config_dir(), exist_ok=True)
 
@@ -318,12 +387,19 @@ def main():
     if 'filenames' in vars(args):
         add_items_from_files(db, args)
         return
+    if 'editor' in vars(args):
+        if not edit(args):
+            print(
+                'No editor specified.  Use `--editor` or define the `EDITOR` environment variable.',
+                file=sys.stderr,
+            )
+        return
 
     if items := load_items(db, args.decks):
         start_review(items, db, intervals, args)
         print('Next review scheduled for {}.'.format(time.ctime(items[0].review_time)))
     else:
-        print(f'No cards scheduled for review.  Use the `add` sub-command to add some.')
+        print('No cards scheduled for review.  Use the `add` sub-command to add some.')
 
 
 if __name__ == '__main__':
