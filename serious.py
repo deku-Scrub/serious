@@ -326,10 +326,10 @@ def start_review(items, db, intervals, args):
         elif result == False:
             item = add_failure(item, intervals)
             update_item(item, db, success=False)
-        else:
-            break
         heapq.heappush(items, item)
         print()
+        if result == None:
+            break
 
 
 def _export_to_csv(db_path, out_file):
